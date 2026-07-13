@@ -11,6 +11,8 @@ import Typography from '@material-ui/core/Typography';
 
 import {config as AuthConfig, storage as AuthStorage} from '@commaai/my-comma-auth';
 
+import * as Auth0 from '../auth0';
+
 import Colors from '../colors';
 import { AuthAppleIcon, AuthGithubIcon, AuthGoogleIcon, RightArrow } from '../icons';
 
@@ -106,6 +108,10 @@ class AnonymousLanding extends Component {
       sessionStorage.setItem('redirectURL', q.get('r'));
     }
 
+    if (Auth0.isConfigured()) {
+      return;   // Auth0 owns login — don't load Apple's sign-in script (legacy comma auth only)
+    }
+
     const script = document.createElement('script');
     document.body.appendChild(script);
     script.onload = () => {
@@ -144,18 +150,39 @@ class AnonymousLanding extends Component {
           <Typography className={classes.tagline}>
             Manage your comma device, view your drives, and use comma prime features
           </Typography>
-          <a href={AuthConfig.GOOGLE_REDIRECT_LINK} className={classes.logInButton}>
-            <img className={classes.buttonImage} src={AuthGoogleIcon} alt="" />
-            <Typography className={classes.buttonText}>Sign in with Google</Typography>
-          </a>
-          <a onClick={() => AppleID.auth.signIn()} className={classes.logInButton}>
-            <img className={classes.buttonImage} src={AuthAppleIcon} alt="" />
-            <Typography className={classes.buttonText}>Sign in with Apple</Typography>
-          </a>
-          <a href={AuthConfig.GITHUB_REDIRECT_LINK} className={`${classes.logInButton} githubAuth`}>
-            <img className={classes.buttonImage} src={AuthGithubIcon} alt="" />
-            <Typography className={classes.buttonText}>Sign in with GitHub</Typography>
-          </a>
+          {Auth0.isConfigured() ? (
+            <>
+              <a onClick={() => Auth0.login(Auth0.CONNECTIONS.google)} className={classes.logInButton}>
+                <img className={classes.buttonImage} src={AuthGoogleIcon} alt="" />
+                <Typography className={classes.buttonText}>Sign in with Google</Typography>
+              </a>
+              <a onClick={() => Auth0.login(Auth0.CONNECTIONS.github)} className={`${classes.logInButton} githubAuth`}>
+                <img className={classes.buttonImage} src={AuthGithubIcon} alt="" />
+                <Typography className={classes.buttonText}>Sign in with GitHub</Typography>
+              </a>
+              <a onClick={() => Auth0.login(Auth0.CONNECTIONS.linkedin)} className={classes.logInButton}>
+                <svg className={classes.buttonImage} viewBox="0 0 24 24" fill="#0A66C2" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M20.45 20.45h-3.55v-5.57c0-1.33-.03-3.04-1.85-3.04-1.85 0-2.14 1.45-2.14 2.94v5.67H9.36V9h3.41v1.56h.05c.47-.9 1.63-1.85 3.36-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28zM5.34 7.43a2.06 2.06 0 1 1 0-4.12 2.06 2.06 0 0 1 0 4.12zM7.12 20.45H3.56V9h3.56v11.45zM22.22 0H1.77C.79 0 0 .77 0 1.72v20.55C0 23.23.79 24 1.77 24h20.45c.98 0 1.78-.77 1.78-1.73V1.72C24 .77 23.2 0 22.22 0z" />
+                </svg>
+                <Typography className={classes.buttonText}>Sign in with LinkedIn</Typography>
+              </a>
+            </>
+          ) : (
+            <>
+              <a href={AuthConfig.GOOGLE_REDIRECT_LINK} className={classes.logInButton}>
+                <img className={classes.buttonImage} src={AuthGoogleIcon} alt="" />
+                <Typography className={classes.buttonText}>Sign in with Google</Typography>
+              </a>
+              <a onClick={() => AppleID.auth.signIn()} className={classes.logInButton}>
+                <img className={classes.buttonImage} src={AuthAppleIcon} alt="" />
+                <Typography className={classes.buttonText}>Sign in with Apple</Typography>
+              </a>
+              <a href={AuthConfig.GITHUB_REDIRECT_LINK} className={`${classes.logInButton} githubAuth`}>
+                <img className={classes.buttonImage} src={AuthGithubIcon} alt="" />
+                <Typography className={classes.buttonText}>Sign in with GitHub</Typography>
+              </a>
+            </>
+          )}
 
           <span className="max-w-sm text-center mt-2 mb-8 text-sm">
             Make sure to sign in with the same account if you have previously

@@ -1,0 +1,18 @@
+name = "waze-proxy"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# Workers KV is the cache (NOT the Cache API: caches.default is a no-op on *.workers.dev
+# domains, and internetchen.de's DNS is on IONOS, so no Cloudflare custom domain).
+# Free tier: 100k reads/day, 1k writes/day. Writes only happen on cache misses
+# (~1 per cell per TTL window), so the fleet dedups onto ~20 writes/hour per driving car.
+#
+# Create the namespace once, then paste its id below:
+#   bunx wrangler kv namespace create WAZE_CACHE
+[[kv_namespaces]]
+binding = "WAZE_CACHE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Secrets (set once, never in this file):
+#   bunx wrangler secret put WAZE_KEY       # the ONE shared RapidAPI key
+#   bunx wrangler secret put PROXY_SECRET   # optional rotatable gate; unset = open proxy

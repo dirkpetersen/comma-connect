@@ -11,6 +11,8 @@ import { CircularProgress, Grid } from '@material-ui/core';
 import MyCommaAuth, { config as AuthConfig, storage as AuthStorage } from '@commaai/my-comma-auth';
 import { athena as Athena, auth as Auth, billing as Billing, request as Request } from '@commaai/api';
 
+import * as Auth0 from './auth0';
+
 import { getZoom, getSegmentRange } from './url';
 import store, { history } from './store';
 
@@ -48,6 +50,21 @@ class App extends Component {
   }
 
   async componentDidMount() {
+    // Self-hosted Auth0 login (Google/GitHub/LinkedIn) — when configured in config.js it owns
+    // login and token acquisition; the token rides the existing my-comma-auth storage so
+    // everything downstream (Request.configure, isAuthenticated, logOut) is unchanged.
+    if (Auth0.isConfigured()) {
+      try {
+        const auth0Token = await Auth0.init();
+        if (auth0Token) {
+          AuthStorage.setCommaAccessToken(auth0Token);
+        }
+      } catch (err) {
+        console.error(err);
+        Sentry.captureException(err, { fingerprint: 'app_auth0_init' });
+      }
+    }
+
     if (window.location) {
       if (window.location.pathname === AuthConfig.AUTH_PATH) {
         try {

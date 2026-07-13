@@ -1,7 +1,22 @@
 # WAZE-API.md — Fleet-scale Waze alerts via an on-demand caching proxy (no Lambda, no cron)
 
-**Status:** DESIGN PROPOSAL. No code changed, nothing deployed. This specifies an implementation; it
-does not implement it.
+**Status:** IMPLEMENTED (2026-07-12). The Worker lives at `waze-proxy/` in this repo; the device
+side is branch `wazeproxy2pnw` in pnw-pilot (proxy is the DEFAULT source — keyless; a
+`police_proxy.json` with key+url still forces legacy direct). Deviations from this design, forced
+by facts on the ground:
+- **Workers KV instead of the Cache API** — `caches.default` is a no-op on `*.workers.dev`
+  domains, and `internetchen.de` DNS is on IONOS (not Cloudflare), so no custom domain / no Cache
+  API. KV free tier (100k reads / 1k writes per day) comfortably covers the fleet; an in-isolate
+  L1 map cuts KV reads further.
+- **Upstream bbox widened by Q/2** (Gemini review): the cache cell center can sit half a cell from
+  the car, so the Waze query over-covers to keep the device's full ±0.30° view populated.
+- **Stale proxy body → `nodata`, not empty-ok** (Gemini review): §6's "treat as empty" would show
+  a false "Clear"; the device raises instead, keeping the never-false-clear invariant.
+- **Error tag in-body**: upstream failures return HTTP 200 with `alerts: []` **plus an `error`
+  tag**; the device surfaces the tag (e.g. `upstream 429`) on the red err line, state `nodata`.
+- §9 (S3 write-through) and a custom domain remain unimplemented options.
+
+The original proposal follows, kept as the design record.
 
 **Owner problem (verbatim):** *"having a Waze API key is not clever and doesn't scale. Move the Waze
 query to our personal Comma Connect platform that also maintains all the drive videos. Write a proposal

@@ -6,6 +6,18 @@ Try it with your openpilot device:
 - **stable:** https://connect.comma.ai
 - **latest:** https://latest.connect-d5y.pages.dev/
 
+## Self-hosted fork
+
+This fork runs an independent, self-hosted instance on AWS (S3 + CloudFront frontend, plus a Lambda
+that mimics comma's upload API so a comma device can store drives in a self-owned S3 bucket). See
+[`CLAUDE.md`](./CLAUDE.md) for the full deployment: infrastructure inventory, frontend redeploy
+steps, the upload pipeline and device patches, and how upload/IP logging is checked.
+
+- **Live URL:** https://comma-connect.aws.internetchen.de
+- **Client IP logging:** the upload Lambda records both the device's public WAN IP (`src_ip`) and
+  its internal LAN IP (`local_ip`) to CloudWatch on every upload request — see the "Client IP
+  logging" section in `CLAUDE.md` for the query commands.
+
 ## Development
 * Install pnpm: https://pnpm.io/installation
 * Install dependencies: `pnpm install`
