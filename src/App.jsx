@@ -44,7 +44,11 @@ class App extends Component {
   }
 
   apiErrorResponseCallback(resp) {
-    if (resp.status === 401) {
+    // Under Auth0 (self-hosted), a 401 from a data API is NOT an auth failure — it means that
+    // endpoint isn't served by our backend yet. Auto-logging-out here would nuke the valid Auth0
+    // session and reload, creating a login→401→logout→login flicker loop. Only legacy comma auth
+    // (where a 401 really is an expired comma token) should log out.
+    if (resp.status === 401 && !Auth0.isConfigured()) {
       MyCommaAuth.logOut();
     }
   }
