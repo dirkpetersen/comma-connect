@@ -11,8 +11,6 @@
 import { createAuth0Client } from '@auth0/auth0-spa-js';
 import window from 'global/window';
 
-export const CALLBACK_PATH = '/auth0-callback';
-
 // Auth0 connection names for the three social providers.
 export const CONNECTIONS = {
   google: 'google-oauth2',
@@ -34,7 +32,9 @@ function getClient() {
       cacheLocation: 'localstorage',
       useRefreshTokens: true,
       authorizationParams: {
-        redirect_uri: `${window.location.origin}${CALLBACK_PATH}`,
+        // redirect back to the app origin (the value Auth0 registers by default from the
+        // "Application Origin" during onboarding — no dedicated callback path to configure)
+        redirect_uri: window.location.origin,
         ...(window.AUTH0_AUDIENCE ? { audience: window.AUTH0_AUDIENCE } : {}),
       },
     });
@@ -47,16 +47,17 @@ function getClient() {
 export async function init() {
   const auth0 = await getClient();
 
-  if (window.location && window.location.pathname === CALLBACK_PATH) {
-    const params = new URLSearchParams(window.location.search);
-    if (params.has('code') && params.has('state')) {
-      try {
-        await auth0.handleRedirectCallback();
-      } catch (err) {
-        console.error('auth0 redirect callback failed', err);
-      }
+  // detect the return from Auth0 by the code+state query params (Auth0 always sends both),
+  // regardless of path, then strip them from the URL so app routing sees a clean location
+  const params = new URLSearchParams(window.location ? window.location.search : '');
+  if (params.has('code') && params.has('state')) {
+    try {
+      await auth0.handleRedirectCallback();
+    } catch (err) {
+      console.error('auth0 redirect callback failed', err);
     }
-    window.history.replaceState({}, document.title, '/');
+    const clean = window.location.pathname + window.location.hash;
+    window.history.replaceState({}, document.title, clean || '/');
   }
 
   try {
