@@ -227,27 +227,40 @@ aws --profile dipeit lambda update-function-configuration \
   --environment "Variables={S3_BUCKET=comma-connect,ALLOWED_DONGLES=2fd850c60cc5bfef,AUTH0_DOMAIN=<tenant>.us.auth0.com,AUTH0_AUDIENCE=<api-identifier>}"
 ```
 
-### Waze police-alert proxy (Cloudflare Worker, `waze-proxy/`)
+### Waze police-alert proxy (AWS Lambda `comma-waze-proxy`)
 
-Fleet-scale Waze police alerts with **no per-device API key** — design + deviations in
-`WAZE-API.md`. Devices `GET /alerts?lat=..&lon=..` (keyless); the Worker holds the one shared
-RapidAPI key (`wrangler secret WAZE_KEY`) and caches transformed results in Workers KV per
-quantized ~5.5 km cell (TTL 180 s), so the whole fleet shares one upstream call per cell per
-window. Device side: `wazeproxy2pnw` in pnw-pilot (proxy = default source; a
-`/data/pnw/location/police_proxy.json` with key+url forces legacy direct).
+Fleet-scale Waze police alerts with **no per-device API key** — design in `WAZE-API.md`. Devices
+`GET /alerts?lat=..&lon=..` (keyless) against the existing API Gateway; the Lambda holds the one
+shared RapidAPI key (env `WAZE_KEY`) and caches transformed results in DynamoDB per quantized
+~5.5 km cell (TTL 180 s), so the whole fleet shares one upstream Waze call per cell per window.
+Runtime is tiny (warm ≈ 100 ms, cold ≈ 5 s one-off; 8 s timeout ceiling). Device side:
+`wazeproxy2pnw` in pnw-pilot (proxy = default; `police_proxy.json` key = direct fallback).
+
+| Resource | Name / ID |
+|---|---|
+| Lambda | `comma-waze-proxy` (us-west-2, handler `waze_handler.handler`, source `uploader-api/waze_handler.py`) |
+| DynamoDB cache | `comma-waze-cache` (PAY_PER_REQUEST, PK `cell`, TTL attr `exp`) |
+| API route | `GET /alerts` on API Gateway `jh69za4byd` (integration `gw1z3tq`) → this Lambda |
+| IAM role | `comma-waze-lambda` (DynamoDB RW on the cache table + logs; **no S3** — isolated from the uploader) |
 
 ```bash
-cd waze-proxy
-bunx wrangler login                        # one-time OAuth
-bunx wrangler kv namespace create WAZE_CACHE   # one-time; paste id into wrangler.toml
-bunx wrangler secret put WAZE_KEY          # the ONE shared RapidAPI key
-bunx wrangler deploy                       # ships src/index.js
-# verify: two GETs to /alerts?lat=47.6&lon=-122.33 → x-waze-cache: MISS then HIT
+# update Lambda code
+cd uploader-api && zip -q waze.zip waze_handler.py
+aws --profile dipeit lambda update-function-code --region us-west-2 \
+  --function-name comma-waze-proxy --zip-file fileb://waze.zip
+
+# rotate the shared Waze key (env var)
+aws --profile dipeit lambda update-function-configuration --region us-west-2 \
+  --function-name comma-waze-proxy \
+  --environment "Variables={WAZE_TABLE=comma-waze-cache,WAZE_KEY=<key>}"
+
+# verify: two GETs to the same cell → 2nd is a fast cached HIT
+curl -s "https://jh69za4byd.execute-api.us-west-2.amazonaws.com/alerts?lat=47.6&lon=-122.33" -w '\n%{time_total}s\n'
 ```
 
-Local dev needs no Cloudflare auth: `bunx wrangler dev` (reads the git-ignored `.dev.vars` for
-`WAZE_KEY`, simulates KV). Optional `PROXY_SECRET` secret turns on the rotatable `x-pnw-auth`
-request gate; unset = open proxy.
+> The `waze-proxy/` Cloudflare Worker in the repo is the original implementation of the same
+> design, kept as a portable alternative — **not** the deployed path (we host on AWS to avoid a
+> second vendor). Optional `PROXY_SECRET` env var turns on the rotatable `x-pnw-auth` gate.
 
 ### Checking upload progress
 

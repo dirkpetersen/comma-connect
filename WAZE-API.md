@@ -1,22 +1,38 @@
 # WAZE-API.md — Fleet-scale Waze alerts via an on-demand caching proxy (no Lambda, no cron)
 
-**Status:** IMPLEMENTED (2026-07-12). The Worker lives at `waze-proxy/` in this repo; the device
-side is branch `wazeproxy2pnw` in pnw-pilot (proxy is the DEFAULT source — keyless; a
-`police_proxy.json` with key+url still forces legacy direct). Deviations from this design, forced
-by facts on the ground:
-- **Workers KV instead of the Cache API** — `caches.default` is a no-op on `*.workers.dev`
-  domains, and `internetchen.de` DNS is on IONOS (not Cloudflare), so no custom domain / no Cache
-  API. KV free tier (100k reads / 1k writes per day) comfortably covers the fleet; an in-isolate
-  L1 map cuts KV reads further.
+**Status:** IMPLEMENTED + DEPLOYED on **AWS** (2026-07-13). The owner chose to stay in one cloud
+rather than add Cloudflare as a new vendor/account, so the proxy is an **AWS Lambda**
+(`comma-waze-proxy`) + **DynamoDB TTL cache** (`comma-waze-cache`) behind the **existing API
+Gateway** (`jh69za4byd`), reachable at:
+
+```
+https://jh69za4byd.execute-api.us-west-2.amazonaws.com/alerts?lat=..&lon=..   (keyless)
+```
+
+Device side: branch `wazeproxy2pnw` in pnw-pilot — proxy is the DEFAULT source; a
+`police_proxy.json` with a key still forces (or falls back to) legacy direct. The mechanism is
+identical to the design below; only the host differs. As-built deviations:
+- **AWS Lambda + DynamoDB, not a Cloudflare Worker + KV.** The device already trusts and reaches
+  the `jh69za4byd` API Gateway, so a `GET /alerts` route (specific route wins over the `$default`
+  upload route) points at a separate, S3-isolated Lambda. Cache = DynamoDB item per quantized cell
+  with a TTL attribute (auto-expiry) + an in-container L1 dict. Fleet dedup is by DynamoDB, proven
+  live (two coords → one cell → one upstream call).
+- **Runtime/cost guardrails** (owner concern): 8 s function-timeout ceiling (you only pay actual
+  ms — warm HIT ≈ 100 ms, cold MISS ≈ 5 s one-off), 4 s upstream timeout, no sleeps/polling. Sits
+  in the free tier at this scale.
 - **Upstream bbox widened by Q/2** (Gemini review): the cache cell center can sit half a cell from
   the car, so the Waze query over-covers to keep the device's full ±0.30° view populated.
 - **Stale proxy body → `nodata`, not empty-ok** (Gemini review): §6's "treat as empty" would show
   a false "Clear"; the device raises instead, keeping the never-false-clear invariant.
 - **Error tag in-body**: upstream failures return HTTP 200 with `alerts: []` **plus an `error`
-  tag**; the device surfaces the tag (e.g. `upstream 429`) on the red err line, state `nodata`.
-- §9 (S3 write-through) and a custom domain remain unimplemented options.
+  tag**; the device surfaces the tag on the red err line, state `nodata`.
+- **Phase-1 fallback** (owner directive): the device polls the proxy first and auto-falls-back to a
+  direct RapidAPI poll if the proxy is down AND a key is still in `police_proxy.json`. Phase 2 =
+  delete the key → proxy-only, keyless.
 
-The original proposal follows, kept as the design record.
+Lambda source: `uploader-api/waze_handler.py`. The `waze-proxy/` Cloudflare Worker in this repo is
+the ORIGINAL implementation of the design below, kept as a portable reference / alternative host —
+it is **not** the deployed path. The original proposal follows as the design record.
 
 **Owner problem (verbatim):** *"having a Waze API key is not clever and doesn't scale. Move the Waze
 query to our personal Comma Connect platform that also maintains all the drive videos. Write a proposal
