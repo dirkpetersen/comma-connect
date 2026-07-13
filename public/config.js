@@ -7,4 +7,4 @@ window.USERADMIN_URL_ROOT = 'https://useradmin.comma.ai/';
 // and the Auth0 API identifier used as the JWT audience.
 window.AUTH0_DOMAIN = 'dev-cllrby28qiip47i0.us.auth0.com';
 window.AUTH0_CLIENT_ID = 'OpUK79iwwOfkv1D9ERK0dHClZbkuspst';
-window.AUTH0_AUDIENCE = '';   // fill after creating the Auth0 API (its Identifier) — enables device-claim + per-user backend
+window.AUTH0_AUDIENCE = 'https://connect-api.internetchen.de';   // Auth0 API identifier → verifiable RS256 access tokens
