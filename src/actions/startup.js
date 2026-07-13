@@ -2,10 +2,17 @@ import * as Sentry from '@sentry/react';
 import { account as Account, devices as Devices } from '@commaai/api';
 import MyCommaAuth from '@commaai/my-comma-auth';
 
+import * as Auth0 from '../auth0';
 import { ACTION_STARTUP_DATA } from './types';
 import { primeFetchSubscription, checkLastRoutesData, selectDevice, fetchSharedDevice } from '.';
 
 async function initProfile() {
+  // Self-hosted (Auth0): comma's profile API is unreachable and its calls hang the startup
+  // Promise.all, leaving the app stuck on the loading spinner. Our own data backend is TODO,
+  // so resolve immediately to a stable logged-in state instead of blocking.
+  if (Auth0.isConfigured()) {
+    return null;
+  }
   if (MyCommaAuth.isAuthenticated()) {
     try {
       return await Account.getProfile();
@@ -22,6 +29,10 @@ async function initProfile() {
 }
 
 async function initDevices() {
+  if (Auth0.isConfigured()) {
+    return [];   // self-hosted: device list will come from our backend (TODO), not comma's API
+  }
+
   let devices = [];
 
   if (MyCommaAuth.isAuthenticated()) {
