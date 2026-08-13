@@ -69,6 +69,7 @@ BUDGET_CALLS = int(BUDGET_USD / COST_PER_CALL)
 
 # Per-device daily cap, independent of (and checked after) the global monthly budget above.
 DEVICE_DAILY_LIMIT = int(os.environ.get('WAZE_DEVICE_DAILY', '750'))
+COUNTER_TTL_S = 40 * 86400   # budget/dev counter items auto-expire ~40d out via DynamoDB TTL (attr 'exp')
 
 _ddb = None
 def table():
@@ -126,8 +127,9 @@ def _budget_count():
 def _budget_inc():
     try:
         table().update_item(Key={'cell': _budget_month_key()},
-                            UpdateExpression='ADD n :one',
-                            ExpressionAttributeValues={':one': 1})
+                            UpdateExpression='SET #e = if_not_exists(#e, :ttl) ADD #n :one',
+                            ExpressionAttributeNames={'#e': 'exp', '#n': 'n'},   # exp/n aliased: dodge any DDB reserved-word
+                            ExpressionAttributeValues={':one': 1, ':ttl': int(time.time()) + COUNTER_TTL_S})
     except Exception as e:
         print(f'budget_write_error {type(e).__name__}: {e}')   # best-effort; never block the response
 
@@ -148,8 +150,9 @@ def _device_count(dev_id):
 def _device_inc(dev_id):
     try:
         table().update_item(Key={'cell': _device_day_key(dev_id)},
-                            UpdateExpression='ADD n :one',
-                            ExpressionAttributeValues={':one': 1})
+                            UpdateExpression='SET #e = if_not_exists(#e, :ttl) ADD #n :one',
+                            ExpressionAttributeNames={'#e': 'exp', '#n': 'n'},   # exp/n aliased: dodge any DDB reserved-word
+                            ExpressionAttributeValues={':one': 1, ':ttl': int(time.time()) + COUNTER_TTL_S})
     except Exception as e:
         print(f'device_write_error {type(e).__name__}: {e}')   # best-effort; never block the response
 
@@ -226,10 +229,20 @@ def handler(event, context):
                                       'spent_usd': round(spent_calls * COST_PER_CALL, 2),
                                       'budget_usd': BUDGET_USD}))
 
-    dev_calls = _device_count(dev_id)
-    if dev_calls >= DEVICE_DAILY_LIMIT:
-        return _resp(429, json.dumps({'error': 'daily limit', 'device': dev_id,
-                                      'count': dev_calls, 'limit': DEVICE_DAILY_LIMIT}))
+    # id-less devices ("noid") share one bucket -> don't let their collisions lock each other out;
+    # the global monthly budget above is still the hard backstop for them.
+    if dev_id != 'noid':
+        dev_calls = _device_count(dev_id)
+        if dev_calls >= DEVICE_DAILY_LIMIT:
+            return _resp(429, json.dumps({'error': 'daily limit', 'device': dev_id,
+                                          'count': dev_calls, 'limit': DEVICE_DAILY_LIMIT}))
+
+    # COUNT THE CALL NOW, before fetching. OpenWebNinja bills on connect, so a slow/timed-out upstream
+    # (our 4 s urllib timeout < a billable request) still costs money; counting only on success would
+    # let a persistently failing upstream spam unmetered and never trip the $25 backstop. Over-counting
+    # a pre-connect failure is the safe (conservative) direction for a budget cap.
+    _budget_inc()
+    _device_inc(dev_id)
 
     err_tag = None
     try:
@@ -240,8 +253,6 @@ def handler(event, context):
     body = json.dumps({'generated_at': now, 'ttl_s': TTL_S, 'alerts': alerts,
                        **({'error': err_tag} if err_tag else {})})
     if not err_tag:                                          # never cache errors -> next poll retries
-        _budget_inc()
-        _device_inc(dev_id)
         _l1[cell] = (now + TTL_S, body)
         try:
             table().put_item(Item={'cell': cell, 'body': body, 'exp': now + TTL_S})
