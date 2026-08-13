@@ -99,7 +99,7 @@ def _iso_to_epoch_ms(s):
     None on any parse failure so a malformed/missing timestamp degrades to a skippable alert
     rather than crashing the whole cache-miss path.
     """
-    if not s:
+    if not isinstance(s, str) or not s:                     # non-str (int/bool/null) -> None, don't .strip() it
         return None
     try:
         s = s.strip().replace('Z', '+00:00')
@@ -170,7 +170,7 @@ def _fetch_waze(clat, clon):
     req = urllib.request.Request(f'{WAZE_URL}?{params}', headers={'x-api-key': WAZE_KEY})
     with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT_S) as r:
         raw = json.loads(r.read())
-    src = raw.get('data', {}).get('alerts', []) if isinstance(raw, dict) else []
+    src = (raw.get('data') or {}).get('alerts', []) if isinstance(raw, dict) else []   # data:null -> {}
     if not isinstance(src, list):
         src = []
     out = []
