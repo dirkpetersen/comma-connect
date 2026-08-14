@@ -36,7 +36,7 @@ yarn-error.log*
 .dev.vars
 
 # build/deploy artifacts
-uploader-api/function.zip
+uploader-api/*.zip
 uploader-api/__pycache__/
 waze-proxy/.wrangler/
 waze-proxy/node_modules/
