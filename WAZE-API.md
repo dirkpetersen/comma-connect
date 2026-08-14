@@ -485,4 +485,79 @@ in `geo.py`, which the proxy design **does not** need.
   selector, and the staleness constant; keep legacy `_poll` / `DEFAULT_PROXY` as fallback until §12.4.
 - **No change** to `selfdrive/ui/onroad/location_services_status.py` — the `police` block contract is
   unchanged. **No `geo.py` geohash helpers** (dropped with the tile design).
+
+---
+
+## 14. Budget & monitoring (deployed 2026-08-13, as-built on AWS)
+
+**Upstream migration.** RapidAPI's `waze-api` listing was retired; the proxy's upstream call moved to
+**OpenWebNinja PAYG** ($0.005/call): `GET https://api.openwebninja.com/waze/alerts-and-jams`, auth
+header `x-api-key`. Alerts live at `data.alerts[]`, each with `alert_id`/`type`/`latitude`/
+`longitude`/`publish_datetime_utc` (ISO string)/`street`/`city`. Unlike the old RapidAPI shape there
+is **no direction/bearing field**, so the device-facing `magvar` is now always `None` — a case the
+device's `_police_dir()` already tolerates. Source of truth: `uploader-api/waze_handler.py`.
+
+Since the proxy now pays *per upstream call*, two independent spend caps were added, both enforced
+**only on a cache MISS** (a cache HIT is free and never counted against either cap):
+
+| Cap | Scope | Default | Counter (DynamoDB `comma-waze-cache`, PK `cell`) | Over-limit response |
+|---|---|---|---|---|
+| Global monthly budget | whole fleet | `WAZE_BUDGET_USD=25` @ `WAZE_COST_PER_CALL=0.005` = 5000 calls/mo | `budget:YYYY-MM` (UTC), attr `n` | **HTTP 402** `{"error":"budget exceeded",...}` — proxy does not call OpenWebNinja, does not cache |
+| Per-device daily | one device (`x-device-id` header, the comma `HardwareSerial`, e.g. `eb1f2f7`) | `WAZE_DEVICE_DAILY=750` calls/device/day | `dev:{id}:YYYY-MM-DD` (UTC), attr `n` | **HTTP 429** `{"error":"daily limit",...}` |
+
+Notes:
+- A missing `x-device-id` header keys to the literal id `"noid"` — that bucket **bypasses** the
+  per-device cap (a shared bucket must not let unrelated id-less devices lock each other out); the
+  global monthly budget is still the hard backstop for them.
+- Miss-path check order in `handler()`: **(1)** global budget → 402, **(2)** per-device daily → 429,
+  **(3)** fetch. Both counters are **incremented before the fetch**, not after success — OpenWebNinja
+  bills on connect, so a slow/failed upstream call still costs money and must still count toward the
+  cap; counting only on success would let a persistently-failing upstream spend unmetered forever.
+- Counter items carry a ~40-day TTL (`exp`, DynamoDB auto-expiry); the `UpdateExpression` aliases the
+  attribute names `#e`/`#n` to dodge DynamoDB reserved words.
+- **IAM gotcha hit during rollout:** the proxy's role `comma-waze-lambda` (inline policy `ddb-cache`)
+  originally granted only `dynamodb:GetItem`/`PutItem`. The counters use `dynamodb:UpdateItem`, which
+  **silently failed** (caught `AccessDenied`, logged, response unaffected) until `UpdateItem` was added
+  to the policy. After touching this role, verify the counters actually increment (see below) — a
+  caught exception here won't surface as an error to the device.
+
+**$5 / $20 early-warning alerts.** OpenWebNinja bills **outside AWS** (their own PAYG account), so a
+native AWS Budget can't see this spend — a small stack watches our own `budget:YYYY-MM` counter
+instead:
+
+- **SNS topic** `pnw-waze-budget-alert` (`arn:aws:sns:us-west-2:454885954148:pnw-waze-budget-alert`),
+  email subscription `dipeit@gmail.com` (confirmed).
+- **Lambda** `waze-budget-checker` (handler `waze_budget_checker.handler`, source
+  `uploader-api/waze_budget_checker.py`, role `waze-budget-checker-role`). Env: `WAZE_TABLE`,
+  `SNS_TOPIC_ARN`, `WARN_USD_LEVELS=5,20`, `BUDGET_USD=25`, `COST_PER_CALL=0.005`.
+- **EventBridge rule** `pnw-waze-budget-hourly` (`rate(1 hour)`) invokes it.
+- Each invocation reads the current month's `budget:YYYY-MM` counter, computes spend, and — the first
+  time in a given UTC month that spend crosses a level in `WARN_USD_LEVELS` — publishes an SNS email
+  and sets a guard flag (`alerted:YYYY-MM:<lvl>`, ~40-day TTL) so that level fires **once per month**.
+  The $25 hard cap (402) is enforced independently inside `comma-waze-proxy`; this Lambda only warns.
+  Email subjects are prefixed `[pnw-pilot]`.
+- Invoking with payload `{"test": true}` sends an immediate TEST email without reading/touching the
+  spend counter or any alert flag.
+
+```bash
+# update the checker's code
+cd uploader-api && zip -q checker.zip waze_budget_checker.py
+aws --profile dipeit lambda update-function-code --region us-west-2 \
+  --function-name waze-budget-checker --zip-file fileb://checker.zip
+
+# change warning thresholds / caps
+aws --profile dipeit lambda update-function-configuration --region us-west-2 \
+  --function-name waze-budget-checker \
+  --environment "Variables={WAZE_TABLE=comma-waze-cache,SNS_TOPIC_ARN=arn:aws:sns:us-west-2:454885954148:pnw-waze-budget-alert,WARN_USD_LEVELS=5\,20,BUDGET_USD=25,COST_PER_CALL=0.005}"
+
+# send a test email (no thresholds/flags touched)
+aws --profile dipeit lambda invoke --function-name waze-budget-checker \
+  --payload '{"test":true}' --cli-binary-format raw-in-base64-out /tmp/out.json
 ```
+
+**Device side** (cross-reference only — see `pnw-pilot/docs/pnw/WAZE-API-KEY.md` for the full user
+guide): `3devpnw` polls the keyless proxy by default, gated on a driving-speed threshold
+(`POLICE_GATE_MPH`, currently 20 for testing / normally 45) so it only polls while actually driving,
+and sends `x-device-id`. A user may instead set a personal OpenWebNinja key via
+`/data/pnw/location/police_proxy.json` (`{"source":"direct","key":"ak_..."}`) — direct mode talks to
+OpenWebNinja straight from the device and has **no budget tracking** at all.

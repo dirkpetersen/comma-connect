@@ -231,17 +231,34 @@ aws --profile dipeit lambda update-function-configuration \
 
 Fleet-scale Waze police alerts with **no per-device API key** — design in `WAZE-API.md`. Devices
 `GET /alerts?lat=..&lon=..` (keyless) against the existing API Gateway; the Lambda holds the one
-shared RapidAPI key (env `WAZE_KEY`) and caches transformed results in DynamoDB per quantized
+shared upstream key (env `WAZE_KEY`) and caches transformed results in DynamoDB per quantized
 ~5.5 km cell (TTL 180 s), so the whole fleet shares one upstream Waze call per cell per window.
 Runtime is tiny (warm ≈ 100 ms, cold ≈ 5 s one-off; 8 s timeout ceiling). Device side:
-`wazeproxy2pnw` in pnw-pilot (proxy = default; `police_proxy.json` key = direct fallback).
+`wazeproxy2pnw` in pnw-pilot (proxy = default; `police_proxy.json` key = direct fallback — see
+`pnw-pilot/docs/pnw/WAZE-API-KEY.md` for the personal-key user guide; direct mode has no budget
+tracking).
+
+**Upstream (migrated 2026-08):** RapidAPI's `waze-api` listing was retired; the proxy now calls
+**OpenWebNinja PAYG** (`https://api.openwebninja.com/waze/alerts-and-jams`, header `x-api-key`,
+$0.005/call). Alerts are at `data.alerts[]` (`alert_id`/`type`/`latitude`/`longitude`/
+`publish_datetime_utc`/`street`/`city`) — there's no direction field upstream anymore, so the
+normalized `magvar` is always `None` (the device already tolerates that).
+
+**Spend caps + monitoring (deployed 2026-08-13)** — see `WAZE-API.md` §14 for the full detail:
+a $25/mo global budget (402 on a cache-MISS once exhausted) and a 750/day per-device cap (429),
+both DynamoDB-counter-based and checked only on a cache MISS; plus an hourly Lambda that emails
+$5/$20 early-warnings since OpenWebNinja spend isn't visible to native AWS Budgets.
 
 | Resource | Name / ID |
 |---|---|
 | Lambda | `comma-waze-proxy` (us-west-2, handler `waze_handler.handler`, source `uploader-api/waze_handler.py`) |
-| DynamoDB cache | `comma-waze-cache` (PAY_PER_REQUEST, PK `cell`, TTL attr `exp`) |
+| DynamoDB cache | `comma-waze-cache` (PAY_PER_REQUEST, PK `cell`, TTL attr `exp`; also holds the `budget:YYYY-MM` / `dev:{id}:YYYY-MM-DD` / `alerted:YYYY-MM:<lvl>` counter items) |
 | API route | `GET /alerts` on API Gateway `jh69za4byd` (integration `gw1z3tq`) → this Lambda |
 | IAM role | `comma-waze-lambda` (DynamoDB RW on the cache table + logs; **no S3** — isolated from the uploader) |
+| Budget-checker Lambda | `waze-budget-checker` (handler `waze_budget_checker.handler`, source `uploader-api/waze_budget_checker.py`) |
+| Budget-checker role | `waze-budget-checker-role` (DynamoDB read on `comma-waze-cache` + `sns:Publish` + logs) |
+| SNS topic | `pnw-waze-budget-alert` (`arn:aws:sns:us-west-2:454885954148:pnw-waze-budget-alert`), email subscription `dipeit@gmail.com` |
+| EventBridge rule | `pnw-waze-budget-hourly` (`rate(1 hour)`) → invokes `waze-budget-checker` |
 
 ```bash
 # update Lambda code
@@ -249,13 +266,27 @@ cd uploader-api && zip -q waze.zip waze_handler.py
 aws --profile dipeit lambda update-function-code --region us-west-2 \
   --function-name comma-waze-proxy --zip-file fileb://waze.zip
 
-# rotate the shared Waze key (env var)
+# rotate the shared Waze key (env var) — also carries the budget-cap env vars (see WAZE-API.md §14)
 aws --profile dipeit lambda update-function-configuration --region us-west-2 \
   --function-name comma-waze-proxy \
-  --environment "Variables={WAZE_TABLE=comma-waze-cache,WAZE_KEY=<key>}"
+  --environment "Variables={WAZE_TABLE=comma-waze-cache,WAZE_KEY=<key>,WAZE_BUDGET_USD=25,WAZE_COST_PER_CALL=0.005,WAZE_DEVICE_DAILY=750}"
 
 # verify: two GETs to the same cell → 2nd is a fast cached HIT
 curl -s "https://jh69za4byd.execute-api.us-west-2.amazonaws.com/alerts?lat=47.6&lon=-122.33" -w '\n%{time_total}s\n'
+
+# update the budget-checker Lambda code
+cd uploader-api && zip -q checker.zip waze_budget_checker.py
+aws --profile dipeit lambda update-function-code --region us-west-2 \
+  --function-name waze-budget-checker --zip-file fileb://checker.zip
+
+# change warning thresholds / caps
+aws --profile dipeit lambda update-function-configuration --region us-west-2 \
+  --function-name waze-budget-checker \
+  --environment "Variables={WAZE_TABLE=comma-waze-cache,SNS_TOPIC_ARN=arn:aws:sns:us-west-2:454885954148:pnw-waze-budget-alert,WARN_USD_LEVELS=5\,20,BUDGET_USD=25,COST_PER_CALL=0.005}"
+
+# send a TEST alert email (doesn't touch thresholds/flags)
+aws --profile dipeit lambda invoke --function-name waze-budget-checker \
+  --payload '{"test":true}' --cli-binary-format raw-in-base64-out /tmp/out.json
 ```
 
 > The `waze-proxy/` Cloudflare Worker in the repo is the original implementation of the same
