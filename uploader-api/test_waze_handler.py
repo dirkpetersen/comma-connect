@@ -113,3 +113,53 @@ def test_upstream_success_does_not_log_an_error(monkeypatch, capsys):
     assert resp['statusCode'] == 200
     assert 'error' not in body
     assert 'upstream_error' not in capsys.readouterr().out
+
+
+# --- policetier2pnw: carry num_thumbs_up so the device can grade confirmed/unconfirmed -----------
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._b = json.dumps(payload).encode()
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _upstream_alert(**over):
+    a = {'type': 'POLICE', 'latitude': 47.06, 'longitude': -122.78, 'alert_id': 'alert-1',
+         'publish_datetime_utc': '2026-08-18T03:05:27.000Z', 'street': 'I-5', 'city': 'Lacey',
+         'num_thumbs_up': 4, 'alert_confidence': 0, 'alert_reliability': 0}
+    a.update(over)
+    return a
+
+
+def _fetch_with(monkeypatch, alerts):
+    monkeypatch.setattr(w.urllib.request, 'urlopen',
+                        lambda req, timeout=None: _FakeResp({'data': {'alerts': alerts}}))
+    return w._fetch_waze(47.0, -122.0)
+
+
+def test_thumbs_up_is_carried_through(monkeypatch):
+    # Waze staff: report lifetime "depends on number of upvotes" -- this is the field the device
+    # grades confirmed/unconfirmed on, so dropping it here silently disables the whole tier model.
+    out = _fetch_with(monkeypatch, [_upstream_alert()])
+    assert len(out) == 1
+    assert out[0]['thumbs'] == 4
+
+
+def test_missing_thumbs_up_becomes_none_not_an_error(monkeypatch):
+    a = _upstream_alert()
+    del a['num_thumbs_up']
+    out = _fetch_with(monkeypatch, [a])
+    assert out[0]['thumbs'] is None
+
+
+def test_non_police_alerts_are_still_filtered_out(monkeypatch):
+    out = _fetch_with(monkeypatch, [_upstream_alert(type='JAM'), _upstream_alert()])
+    assert len(out) == 1 and out[0]['thumbs'] == 4

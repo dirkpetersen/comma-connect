@@ -182,10 +182,16 @@ def _fetch_waze(clat, clon):
     for a in src:
         if not isinstance(a, dict) or a.get('type') != 'POLICE':
             continue
+        # `thumbs` (policetier2pnw 2026-08-18): OpenWebNinja's num_thumbs_up. Waze staff have stated the
+        # app's own report lifetime is a function of upvotes ("the more upvoted the report is, the more
+        # time it lasts on the map"), so this is the SAME input the app expires on -- the device grades
+        # a report confirmed/unconfirmed from it rather than from age alone. alert_confidence and
+        # alert_reliability are also present upstream but are hardcoded 0 on every sample, so they are
+        # deliberately NOT carried.
         out.append({'type': 'POLICE', 'lat': a.get('latitude'), 'lon': a.get('longitude'),
                     'magvar': None, 'ts': _iso_to_epoch_ms(a.get('publish_datetime_utc')),
                     'uuid': a.get('alert_id'), 'street': a.get('street') or '',
-                    'town': a.get('city') or ''})
+                    'town': a.get('city') or '', 'thumbs': a.get('num_thumbs_up')})
     return out
 
 
