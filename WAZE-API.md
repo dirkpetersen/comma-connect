@@ -18,7 +18,9 @@ identical to the design below; only the host differs. As-built deviations:
   with a TTL attribute (auto-expiry) + an in-container L1 dict. Fleet dedup is by DynamoDB, proven
   live (two coords → one cell → one upstream call).
 - **Runtime/cost guardrails** (owner concern): 8 s function-timeout ceiling (you only pay actual
-  ms — warm HIT ≈ 100 ms, cold MISS ≈ 5 s one-off), 4 s upstream timeout, no sleeps/polling. Sits
+  ms — warm HIT ≈ 100 ms, cold MISS ≈ 5 s one-off), 6 s upstream timeout (raised from 4 s on
+  2026-08-18: measured duration averages 1.5–2.5 s, so 4 s tripped on ordinary upstream latency —
+  the device saw `upstream TimeoutError`; stays under the 8 s ceiling), no sleeps/polling. Sits
   in the free tier at this scale.
 - **Upstream bbox widened by Q/2** (Gemini review): the cache cell center can sit half a cell from
   the car, so the Waze query over-covers to keep the device's full ±0.30° view populated.
@@ -557,7 +559,7 @@ aws --profile dipeit lambda invoke --function-name waze-budget-checker \
 
 **Device side** (cross-reference only — see `pnw-pilot/docs/pnw/WAZE-API-KEY.md` for the full user
 guide): `3devpnw` polls the keyless proxy by default, gated on a driving-speed threshold
-(`POLICE_GATE_MPH`, currently 20 for testing / normally 45) so it only polls while actually driving,
+(`POLICE_GATE_MPH`, 45) so it only polls while actually driving,
 and sends `x-device-id`. A user may instead set a personal OpenWebNinja key via
 `/data/pnw/location/police_proxy.json` (`{"source":"direct","key":"ak_..."}`) — direct mode talks to
 OpenWebNinja straight from the device and has **no budget tracking** at all.

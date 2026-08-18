@@ -30,8 +30,10 @@ COST/RUNTIME (owner concern 2026-07-13): this runs for tens of ms, not "a long t
   - cache HIT  -> one DynamoDB read, ~10-30 ms, no upstream call, no budget check
   - cache MISS -> budget check, then one Waze call, ~200-400 ms (rare: 1 per cell per TTL
     across the fleet, further capped by the monthly budget above)
-  Function timeout is capped at 5 s so a hung upstream can never bill more than that; the
-  urllib timeout is 4 s. No sleeps, no polling, no long-lived work.
+  Function timeout is 8 s so a hung upstream can never bill more than that; the urllib
+  timeout is UPSTREAM_TIMEOUT_S (6 s), leaving ~2 s of headroom to still return the 200 +
+  error-tag contract instead of dying on the function timeout. No sleeps, no polling, no
+  long-lived work.
 
 Response contract (device: PoliceUpdater._parse_proxy_body):
   { generated_at:<epoch s>, ttl_s:<int>, alerts:[{type,lat,lon,magvar,ts,uuid,street,town}],
@@ -60,7 +62,10 @@ PROXY_SECRET = os.environ.get('PROXY_SECRET', '')      # optional x-pnw-auth gat
 TTL_S = 180        # police reports persist minutes; 2-5 min shields the shared quota
 BBOX_DEG = 0.30    # match the device's POLICE_BBOX_DEG (~±20 mi)
 Q = 0.05           # cache-cell size ~5.5 km
-UPSTREAM_TIMEOUT_S = 4
+UPSTREAM_TIMEOUT_S = 6   # measured Lambda duration averages 1.5-2.5 s, so the old 4 s ceiling
+                         # tripped on ordinary upstream latency ('upstream TimeoutError' on the
+                         # device). Must stay < the 8 s function timeout so we return the 200 +
+                         # error-tag contract rather than being killed mid-request.
 
 # Monthly PAYG budget cap: OpenWebNinja bills COST_PER_CALL per upstream (cache-MISS) call.
 BUDGET_USD = float(os.environ.get('WAZE_BUDGET_USD', '25'))
@@ -238,17 +243,23 @@ def handler(event, context):
                                           'count': dev_calls, 'limit': DEVICE_DAILY_LIMIT}))
 
     # COUNT THE CALL NOW, before fetching. OpenWebNinja bills on connect, so a slow/timed-out upstream
-    # (our 4 s urllib timeout < a billable request) still costs money; counting only on success would
+    # (our 6 s urllib timeout < a billable request) still costs money; counting only on success would
     # let a persistently failing upstream spam unmetered and never trip the $25 backstop. Over-counting
     # a pre-connect failure is the safe (conservative) direction for a budget cap.
     _budget_inc()
     _device_inc(dev_id)
 
     err_tag = None
+    t0 = time.monotonic()
     try:
         alerts = _fetch_waze(float(_q(lat)), float(_q(lon)))
     except Exception as e:
         alerts, err_tag = [], f'upstream {type(e).__name__}'[:40]
+        # Was silent before: the device surfaced 'upstream <Exc>' while CloudWatch showed nothing,
+        # so these could only be counted from on-device logs. elapsed distinguishes a hit of the
+        # UPSTREAM_TIMEOUT_S ceiling from an instant connection/DNS failure.
+        print(f'upstream_error {type(e).__name__}: {e} cell={cell} '
+              f'elapsed={time.monotonic() - t0:.2f}s timeout={UPSTREAM_TIMEOUT_S}s')
 
     body = json.dumps({'generated_at': now, 'ttl_s': TTL_S, 'alerts': alerts,
                        **({'error': err_tag} if err_tag else {})})
