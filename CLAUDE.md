@@ -122,7 +122,10 @@ This instance is deployed independently of comma's infrastructure because the de
 node_modules/.bin/vite build
 
 # upload hashed assets (long cache)
+# ⚠️ The bucket ALSO holds all drive data (drives/, ~1 TB) and the Lambda's claims/ + users/ records.
+#    With --delete, every prefix NOT excluded below is DELETED. Never drop these three excludes.
 aws --profile dipeit s3 sync dist/ s3://comma-connect/ --delete \
+  --exclude "drives/*" --exclude "claims/*" --exclude "users/*" \
   --cache-control "public, max-age=31536000, immutable" \
   --exclude "index.html" --exclude "sw.js" --exclude "workbox-*.js" \
   --exclude "manifest.webmanifest" --exclude "config.js"
@@ -132,6 +135,13 @@ for f in index.html sw.js manifest.webmanifest config.js workbox-*.js; do
   aws --profile dipeit s3 cp dist/$f s3://comma-connect/$f \
     --cache-control "no-cache, no-store, must-revalidate"
 done
+
+# 2026-09-27 lockdown: CloudFront may read ONLY the web-app paths (bucket-policy allowlist: index.html,
+# config.js, sw.js*, workbox-*, manifest.*, robots.txt, favicon.*, icon-*, assets/*, images/*), and a
+# `drives/*` behaviour (CloudFront Function comma-connect-deny-drives) returns 403. A NEW root file name
+# from a build must be added to the bucket policy, or CloudFront silently serves index.html instead.
+# After each deploy, re-run the probe: /home/dp/gh/comma/_scratch/aws-lockdown-backup-20260927/probe.sh
+# Details + rollback: /home/dp/gh/comma/docs/AWS-COST-2026-09.md §6c.
 
 # bust CloudFront edge cache
 aws --profile dipeit cloudfront create-invalidation \
