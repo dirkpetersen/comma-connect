@@ -14,7 +14,7 @@ uploaded to our bucket and (b) nobody has claimed it yet — first-claim-wins. T
 unclaimed devices is NEVER exposed; a claimant must arrive knowing their device's ID (from the
 device UI). State lives in S3: users/{sub}.json and claims/{dongle_id}.json.
 
-Env: S3_BUCKET, ALLOWED_DONGLES (device realm), AUTH0_DOMAIN + AUTH0_AUDIENCE (user realm;
+Env: S3_BUCKET, ALLOWED_DONGLES, DEVICE_PUBKEYS + AUTH_SIG_MODE (device realm; see CLAUDE.md "Device JWT signature check"), AUTH0_DOMAIN + AUTH0_AUDIENCE (user realm;
 empty = user realm disabled), ALLOWED_ORIGINS (CORS, comma-separated).
 """
 import json
@@ -86,14 +86,72 @@ def bearer_token(event, prefix):
 
 # ---------------------------------------------------------------- DEVICE realm (JWT <token>)
 
+def _load_device_pubkeys():
+    """DEVICE_PUBKEYS env: JSON {dongle_id: {"n": b64url, "e": b64url}} (RSA public JWK members;
+    make it from a PEM with tools/device_pubkey_env.py). Bad JSON is logged loudly, never silent."""
+    raw = os.environ.get('DEVICE_PUBKEYS', '')
+    if not raw:
+        return {}
+    try:
+        keys = json.loads(raw)
+        assert isinstance(keys, dict)
+        return keys
+    except (ValueError, AssertionError) as e:
+        print(f'AUTH_SIG_CONFIG_ERROR DEVICE_PUBKEYS unparseable: {type(e).__name__}')
+        return {}
+
+DEVICE_PUBKEYS = _load_device_pubkeys()
+# 'log' (default for the first deploy): a failed signature check is logged, request proceeds.
+# 'enforce': a failed check returns 401. Anything else is treated as 'enforce' (fail closed).
+AUTH_SIG_MODE = os.environ.get('AUTH_SIG_MODE', 'log')
+JWT_SKEW_S = 300
+
+def verify_device_jwt(token, dongle_id):
+    """Verify an openpilot device JWT (common/api.py: RS256, /persist/comma/id_rsa, claims
+    identity/nbf/iat/exp). Returns None if valid, else a short reason string. Never raises."""
+    try:
+        if not token or token.count('.') != 2:
+            return 'malformed'
+        h_b64, p_b64, s_b64 = token.split('.')
+        header = json.loads(_b64url_decode(h_b64))
+        if header.get('alg') != 'RS256':     # pinned: rejects none / HS256 / ES256 confusion
+            return 'bad_alg'
+        jwk = DEVICE_PUBKEYS.get(dongle_id)
+        if not jwk:
+            return 'nokey'
+        if not _rs256_verify(f'{h_b64}.{p_b64}'.encode(), _b64url_decode(s_b64), jwk):
+            return 'bad_sig'
+        claims = json.loads(_b64url_decode(p_b64))
+        if claims.get('identity') != dongle_id:
+            return 'bad_identity'
+        now = time.time()
+        if 'exp' not in claims:
+            return 'no_exp'
+        if float(claims['exp']) < now - JWT_SKEW_S:
+            return 'expired'
+        if 'nbf' in claims and float(claims['nbf']) > now + JWT_SKEW_S:
+            return 'not_yet_valid'
+        return None
+    except Exception as e:                    # any parse/type error is a verification failure
+        return f'malformed:{type(e).__name__}'
+
 def check_auth(event, dongle_id):
     if ALLOWED_DONGLES and dongle_id not in ALLOWED_DONGLES:
         return False
     token = bearer_token(event, 'JWT') or ''
-    # device JWTs are decoded without signature verification (private API; identity pinning +
-    # the dongle allowlist bound the blast radius to "can upload files into its own prefix")
-    payload = decode_jwt_payload(token)
-    return payload.get('identity') == dongle_id
+    # identity pin (unchanged): the unverified claim must name the dongle in the URL
+    if decode_jwt_payload(token).get('identity') != dongle_id:
+        return False
+    reason = verify_device_jwt(token, dongle_id)
+    if reason is None:
+        return True
+    route = str(event.get('rawPath', '') or event.get('path', ''))[:80]
+    route = re.sub(r'[^\x21-\x7e]', '', route)    # log-injection safe; the token is never logged
+    enforcing = AUTH_SIG_MODE != 'log'
+    tag = 'AUTH_SIG_NOKEY' if reason == 'nokey' else 'AUTH_SIG_FAIL'
+    print(f'{tag} reason={reason} dongle={dongle_id} route={route} '
+          f'mode={AUTH_SIG_MODE} action={"reject" if enforcing else "allow"}')
+    return not enforcing
 
 def handle_upload_url(event, dongle_id):
     query = event.get('queryStringParameters') or {}

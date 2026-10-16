@@ -158,7 +158,21 @@ The comma device (`dongle_id: 2fd850c60cc5bfef`) uploads drives to our Lambda in
 | `GET /v1.1/devices/{dongle_id}` | Returns minimal device record so openpilot doesn't abort |
 | `GET /v1/me` | Returns minimal user identity |
 
-Auth: the device sends `Authorization: JWT {device_jwt}`. The Lambda decodes the JWT (no signature verification — private API) and checks the `identity` claim matches the dongle_id in the URL path.
+Auth: the device sends `Authorization: JWT {device_jwt}`. The Lambda checks the `identity` claim matches the dongle_id in the URL path **and verifies the RS256 signature** against the device public key (`DEVICE_PUBKEYS`), controlled by `AUTH_SIG_MODE` — see "Device JWT signature check" below. (The dongle id is public, so identity matching alone let anyone mint a token and get presigned PUTs.)
+
+### Device JWT signature check (`AUTH_SIG_MODE`)
+
+openpilot (`common/api.py`) signs `{identity, nbf, iat, exp}` with `/persist/comma/id_rsa` using **RS256**. `verify_device_jwt` pins `alg=RS256` (rejects `none`/HS256), verifies with the stdlib `_rs256_verify` against the dongle's key, then requires `identity == dongle`, `exp` present and not past (300 s skew), `nbf` not in the future (300 s skew). Covered routes (all that call `check_auth`): `GET /v1.4/{dongle}/upload_url/` and `GET /v1(.1)/devices/{dongle}`. **Not covered:** the device variant of `GET /v1/me` (decodes the token unverified; returns only a fixed stub, no S3 access).
+
+Env vars (Lambda `comma-uploader-api`):
+- `DEVICE_PUBKEYS` — JSON `{"<dongle>": {"n": "<b64url>", "e": "<b64url>"}}`. Public key only. Generate with `uploader-api/tools/device_pubkey_env.py` (no network); never commit the output.
+- `AUTH_SIG_MODE` — `log` (default if unset): a failed check is logged and the request proceeds as before. `enforce`: failed check returns 401. Any other value is treated as `enforce` (fail closed).
+
+Log lines (CloudWatch `/aws/lambda/comma-uploader-api`; the token is never logged):
+`AUTH_SIG_FAIL reason=<bad_sig|bad_alg|expired|no_exp|not_yet_valid|bad_identity|malformed*> dongle=.. route=.. mode=.. action=allow|reject`,
+`AUTH_SIG_NOKEY` (no key for that dongle), `AUTH_SIG_CONFIG_ERROR` (DEVICE_PUBKEYS is not valid JSON).
+
+Rollout: (1) deploy code + `DEVICE_PUBKEYS`, `AUTH_SIG_MODE=log`; (2) let the real device upload through at least one drive plus a few `upload_url` polls and confirm CloudWatch shows **zero** `AUTH_SIG_FAIL` / `AUTH_SIG_NOKEY` for it (and that requests are arriving at all); any hits from other sources are forgery attempts; (3) set `AUTH_SIG_MODE=enforce`, drive again, confirm uploads still 200. Rollback: set `AUTH_SIG_MODE=log` (or repoint the alias/redeploy the previous version). **`update-function-configuration --environment` REPLACES all variables** — read the current ones first (`get-function-configuration`) and send the full merged set.
 
 **Lambda source:** `uploader-api/handler.py` (in this repo — kept in sync with the deployed function)
 
