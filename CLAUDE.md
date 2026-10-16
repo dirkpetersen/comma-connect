@@ -172,7 +172,7 @@ Log lines (CloudWatch `/aws/lambda/comma-uploader-api`; the token is never logge
 `AUTH_SIG_FAIL reason=<bad_sig|bad_alg|expired|no_exp|not_yet_valid|bad_identity|malformed*> dongle=.. route=.. mode=.. action=allow|reject`,
 `AUTH_SIG_NOKEY` (no key for that dongle), `AUTH_SIG_CONFIG_ERROR` (DEVICE_PUBKEYS is not valid JSON).
 
-Rollout: (1) deploy code + `DEVICE_PUBKEYS`, `AUTH_SIG_MODE=log`; (2) let the real device upload through at least one drive plus a few `upload_url` polls and confirm CloudWatch shows **zero** `AUTH_SIG_FAIL` / `AUTH_SIG_NOKEY` for it (and that requests are arriving at all); any hits from other sources are forgery attempts; (3) set `AUTH_SIG_MODE=enforce`, drive again, confirm uploads still 200. Rollback: set `AUTH_SIG_MODE=log` (or repoint the alias/redeploy the previous version). **`update-function-configuration --environment` REPLACES all variables** — read the current ones first (`get-function-configuration`) and send the full merged set.
+Rollout: (1) deploy code + `DEVICE_PUBKEYS`, `AUTH_SIG_MODE=log`; (2) let the real device upload through at least one drive plus a few `upload_url` polls and confirm CloudWatch shows **zero** `AUTH_SIG_FAIL` / `AUTH_SIG_NOKEY` for it (and that requests are arriving at all); any hits from other sources are forgery attempts; (3) set `AUTH_SIG_MODE=enforce`, drive again, confirm uploads still 200. Rollback: set `AUTH_SIG_MODE=log` (config only), or `update-function-code` with the previous zip (kept privately; the function had no versions/aliases before this change — version 1 was published with the signature-check deploy, so there is no earlier version to repoint to). Keys must be RSA e=65537, n >= 2048 bits, else `AUTH_SIG_CONFIG_ERROR` and that dongle counts as keyless. **`update-function-configuration --environment` REPLACES all variables** — read the current ones first (`get-function-configuration`) and send the full merged set.
 
 **Lambda source:** `uploader-api/handler.py` (in this repo — kept in sync with the deployed function)
 
@@ -190,6 +190,18 @@ To update the allowed dongle_id:
 aws --profile dipeit lambda update-function-configuration \
   --region us-west-2 --function-name comma-uploader-api \
   --environment "Variables={S3_BUCKET=comma-connect,ALLOWED_DONGLES=<dongle_id>}"
+```
+
+CloudWatch alarm on rejected requests (documented, NOT executed; only fires in `enforce` mode because `action=reject` is logged only then — in `log` mode watch `action=allow` lines by hand):
+```bash
+aws --profile dipeit --region us-west-2 logs put-metric-filter \
+  --log-group-name /aws/lambda/comma-uploader-api --filter-name auth-sig-reject \
+  --filter-pattern '"action=reject" ?"AUTH_SIG_FAIL" ?"AUTH_SIG_NOKEY"' \
+  --metric-transformations metricName=AuthSigReject,metricNamespace=CommaConnect,metricValue=1,defaultValue=0
+aws --profile dipeit --region us-west-2 cloudwatch put-metric-alarm --alarm-name comma-uploader-auth-sig-reject \
+  --namespace CommaConnect --metric-name AuthSigReject --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold --treat-missing-data notBreaching \
+  --alarm-actions arn:aws:sns:us-west-2:454885954148:pnw-waze-budget-alert
 ```
 
 ### Device configuration (comma 3X — pnw-pilot git checkout)

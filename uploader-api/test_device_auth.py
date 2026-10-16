@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import handler  # noqa: E402
 from tools import device_pubkey_env  # noqa: E402
 
-pytest.importorskip("cryptography")
+# no importorskip: a missing `cryptography` must FAIL these tests, not silently skip them (Rule 2)
 from cryptography.hazmat.primitives.asymmetric import rsa, padding  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
 
@@ -178,6 +178,34 @@ def test_identity_pin_and_allowlist_unchanged(key, monkeypatch):
 
 def test_missing_header_rejected_log_mode():
     assert handler.check_auth({'headers': {}}, DONGLE) is False
+
+
+def _env_key(bits=2048, e=65537):
+    k = rsa.generate_private_key(public_exponent=e, key_size=bits)
+    p = k.public_key().public_numbers()
+    return {'n': device_pubkey_env._b64u(p.n), 'e': device_pubkey_env._b64u(p.e)}
+
+
+def test_pubkey_validation(monkeypatch, capsys):
+    good, weak, odd_e = _env_key(), _env_key(1024), _env_key(2048, 3)
+    monkeypatch.setenv('DEVICE_PUBKEYS', json.dumps({
+        DONGLE: good, 'aaaaaaaaaaaaaaaa': weak, 'bbbbbbbbbbbbbbbb': odd_e,
+        'cccccccccccccccc': {'n': 'x'}, 'dddddddddddddddd': 'junk'}))
+    keys = handler._load_device_pubkeys()
+    assert set(keys) == {DONGLE}
+    out = capsys.readouterr().out
+    assert out.count('AUTH_SIG_CONFIG_ERROR') == 4
+    for d in ('aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb', 'cccccccccccccccc', 'dddddddddddddddd'):
+        assert f'dongle={d}' in out
+
+
+def test_weak_key_dongle_treated_as_nokey(key, monkeypatch, capsys):
+    monkeypatch.setenv('DEVICE_PUBKEYS', json.dumps({DONGLE: _env_key(1024)}))
+    monkeypatch.setattr(handler, 'DEVICE_PUBKEYS', handler._load_device_pubkeys())
+    monkeypatch.setattr(handler, 'AUTH_SIG_MODE', 'enforce')
+    capsys.readouterr()
+    assert handler.check_auth(_event(_mint(key, _claims())), DONGLE) is False
+    assert 'AUTH_SIG_NOKEY' in capsys.readouterr().out
 
 
 def test_bad_env_json_logged(monkeypatch, capsys):

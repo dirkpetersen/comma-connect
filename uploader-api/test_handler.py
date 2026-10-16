@@ -17,7 +17,7 @@ os.environ['AUTH0_AUDIENCE'] = 'https://connect-api.test'
 
 import handler  # noqa: E402
 
-crypto = pytest.importorskip("cryptography")
+# no importorskip: missing `cryptography` must FAIL, not skip (Rule 2)
 from cryptography.hazmat.primitives.asymmetric import rsa, padding  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
 

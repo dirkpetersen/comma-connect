@@ -95,10 +95,24 @@ def _load_device_pubkeys():
     try:
         keys = json.loads(raw)
         assert isinstance(keys, dict)
-        return keys
     except (ValueError, AssertionError) as e:
         print(f'AUTH_SIG_CONFIG_ERROR DEVICE_PUBKEYS unparseable: {type(e).__name__}')
         return {}
+    good = {}
+    for dongle, jwk in keys.items():
+        # openpilot keys are RSA-2048+ with e=65537; anything else is a misconfiguration (or a
+        # weak-key attack on the env var) -> loud error, and the dongle is treated as keyless.
+        try:
+            n = int.from_bytes(_b64url_decode(jwk['n']), 'big')
+            e = int.from_bytes(_b64url_decode(jwk['e']), 'big')
+            if e != 65537 or n.bit_length() < 2048:
+                raise ValueError(f'e={e} n_bits={n.bit_length()}')
+        except (KeyError, TypeError, ValueError, AttributeError) as ex:
+            print(f'AUTH_SIG_CONFIG_ERROR DEVICE_PUBKEYS key for dongle={dongle} rejected: '
+                  f'{type(ex).__name__}: {ex}')
+            continue
+        good[dongle] = jwk
+    return good
 
 DEVICE_PUBKEYS = _load_device_pubkeys()
 # 'log' (default for the first deploy): a failed signature check is logged, request proceeds.
