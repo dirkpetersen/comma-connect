@@ -337,6 +337,112 @@ def handle_claim(event, claims):
     print(f'CLAIM sub={claims["sub"]} email={claims.get("email", "")} dongle={dongle_id}')
     return ok({'dongle_id': dongle_id, 'claimed': True}, event)
 
+# ---------------------------------------------------------------- CURVEDB routes (device JWT, ALWAYS enforced)
+# They hand out private data, so unlike check_auth they ignore AUTH_SIG_MODE (no log mode).
+
+CURVEDB_BUCKET = os.environ.get('CURVEDB_BUCKET', 'comma-curvedb-backup-454885954148')
+CURVEDB_DONGLES = set(d for d in os.environ.get('CURVEDB_DONGLES', '').split(',') if d)
+CURVEDB_PRESIGN_S = 300
+CURVEDB_REPORT_MAX = 2048
+HEX64_RE = re.compile(r'^[0-9a-f]{64}$')
+REPORT_STATES = {'disabled', 'waiting_clock', 'waiting_unmetered', 'none_published', 'current',
+                 'installed', 'held_hand_change', 'refused', 'error'}
+REPORT_SHAS = ('live_sha', 'pointer_sha', 'last_auto_sha')
+REPORT_KEYS = set(REPORT_SHAS) | {'auto_utc', 'loaded', 'state', 'reason', 'free_mb', 'git_sha'}
+
+def curvedb_auth(event, dongle_id):
+    """True only for a listed dongle with a fully verified device JWT. Never logs the token."""
+    if dongle_id not in CURVEDB_DONGLES:
+        print(f'CURVEDB_AUTH_FAIL reason=not_listed dongle={dongle_id}')
+        return False
+    reason = verify_device_jwt(bearer_token(event, 'JWT') or '', dongle_id)
+    if reason is not None:
+        print(f'CURVEDB_AUTH_FAIL reason={reason} dongle={dongle_id}')
+        return False
+    return True
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+def handle_curvedb_approved(dongle_id):
+    try:
+        ptr = json.loads(s3().get_object(Bucket=CURVEDB_BUCKET, Key='curvedb/approved.json')['Body'].read())
+    except ClientError as e:
+        if e.response.get('Error', {}).get('Code') in ('NoSuchKey', '404'):
+            return {'statusCode': 404, 'headers': {'Content-Type': 'application/json'},
+                    'body': json.dumps({'error': 'none published'})}
+        print(f'CURVEDB_S3_ERROR code={e.response.get("Error", {}).get("Code")} dongle={dongle_id}')
+        return err(503, 'temporarily unavailable')
+    except Exception as e:                    # network / unparseable pointer: fail closed, never "none"
+        print(f'CURVEDB_POINTER_ERROR {type(e).__name__} dongle={dongle_id}')
+        return err(503, 'temporarily unavailable')
+    if not (isinstance(ptr, dict) and isinstance(ptr.get('sha256'), str) and HEX64_RE.match(ptr['sha256'])
+            and isinstance(ptr.get('manifest_sha256'), str) and HEX64_RE.match(ptr['manifest_sha256'])
+            and _is_int(ptr.get('rows_bytes')) and _is_int(ptr.get('manifest_bytes'))
+            and isinstance(ptr.get('build'), str) and isinstance(ptr.get('approved_utc'), str)):
+        print(f'CURVEDB_POINTER_MALFORMED dongle={dongle_id}')
+        return err(503, 'temporarily unavailable')
+    sha = ptr['sha256']
+    try:     # keys come from the validated sha, never from pointer-supplied key strings
+        urls = {name: s3().generate_presigned_url(
+                    'get_object', Params={'Bucket': CURVEDB_BUCKET, 'Key': f'curvedb/tables/{sha}/{fn}'},
+                    ExpiresIn=CURVEDB_PRESIGN_S)
+                for name, fn in (('rows_url', 'curvedb_v2_rows.json.zst'), ('manifest_url', 'manifest.json'))}
+    except Exception as e:
+        print(f'CURVEDB_PRESIGN_ERROR {type(e).__name__} dongle={dongle_id}')
+        return err(503, 'temporarily unavailable')
+    out = {k: ptr[k] for k in ('sha256', 'rows_bytes', 'manifest_sha256', 'manifest_bytes', 'build', 'approved_utc')}
+    out.update(urls)
+    print(f'CURVEDB_APPROVED dongle={dongle_id} sha={sha[:8]}')    # URLs never logged
+    return ok(out)
+
+def handle_curvedb_report(event, dongle_id):
+    raw = event.get('body') or ''
+    if event.get('isBase64Encoded'):
+        try:
+            raw = base64.b64decode(raw).decode()
+        except Exception:
+            return err(400, 'bad body')
+    if len(raw.encode()) > CURVEDB_REPORT_MAX:
+        return err(400, 'body too large')
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return err(400, 'bad body')
+    if not isinstance(body, dict) or set(body) - REPORT_KEYS:
+        return err(400, 'bad schema')
+    rec = {}
+    for k, v in body.items():
+        if k in REPORT_SHAS:
+            if v is not None and not (isinstance(v, str) and HEX64_RE.match(v)):
+                return err(400, f'bad {k}')
+        elif k == 'state':
+            if v not in REPORT_STATES:
+                return err(400, 'bad state')
+        elif k == 'reason':
+            if not isinstance(v, str) or len(v) > 200:
+                return err(400, 'bad reason')
+            v = re.sub(r'[^\x20-\x7e]', '?', v)
+        elif k == 'loaded':
+            if not isinstance(v, bool):
+                return err(400, 'bad loaded')
+        elif k == 'free_mb':
+            if not _is_int(v):
+                return err(400, 'bad free_mb')
+        elif not (isinstance(v, str) and len(v) <= 64 and re.match(r'^[A-Za-z0-9:._+-]*$', v)):
+            return err(400, f'bad {k}')     # auto_utc, git_sha
+        rec[k] = v
+    rec['received_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    try:
+        s3().put_object(Bucket=CURVEDB_BUCKET, Key=f'curvedb/device/{dongle_id}/report.json',
+                        Body=json.dumps(rec).encode(), ContentType='application/json')
+    except Exception as e:
+        print(f'CURVEDB_REPORT_PUT_ERROR {type(e).__name__} dongle={dongle_id}')
+        return err(503, 'temporarily unavailable')
+    live = rec.get('live_sha') or ''
+    print(f'CURVEDB_REPORT dongle={dongle_id} state={rec.get("state")} live={live[:8]}')
+    return ok({'ok': True})
+
 # ---------------------------------------------------------------- dispatch
 
 def handler(event, context):
@@ -362,6 +468,16 @@ def handler(event, context):
         if not check_auth(event, dongle_id):
             return err(401, 'Unauthorized')
         return handle_upload_url(event, dongle_id)
+
+    # curve DB pull (device JWT, signature ALWAYS enforced, see curvedb_auth)
+    m = re.match(r'^/v1/curvedb/([0-9a-f]{16})/(approved|report)/?$', path)
+    if m and method == ('GET' if m.group(2) == 'approved' else 'POST'):
+        dongle_id = m.group(1)
+        if not curvedb_auth(event, dongle_id):
+            return err(401, 'unauthorized')
+        if m.group(2) == 'approved':
+            return handle_curvedb_approved(dongle_id)
+        return handle_curvedb_report(event, dongle_id)
 
     # GET /v1.1/devices/{dongle_id} or /v1/devices/{dongle_id}
     m = re.match(r'^/v1(?:\.1)?/devices/([0-9a-f]{16})/?$', path)

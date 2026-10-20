@@ -381,3 +381,37 @@ aws --profile dipeit logs filter-log-events --region us-west-2 \
 `process_config.py` patches, this is overwritten by an openpilot overlay update — **re-apply it after
 any update.** The matching Lambda side reads `queryStringParameters['local_ip']` in the `CLIENT_IP`
 print.
+
+## Curve DB pull routes (device JWT, signature ALWAYS enforced)
+
+`GET /v1/curvedb/{dongle}/approved` and `POST /v1/curvedb/{dongle}/report` (design: workdir `docs/CURVEDB-CLOUD-DESIGN.md` §2.4).
+They ignore `AUTH_SIG_MODE` (no log mode): dongle must be in `CURVEDB_DONGLES` and the `Authorization: JWT <token>` header must verify
+(RS256 pinned, signature, identity == dongle, exp). Any failure is `401 unauthorized`. Code only here; no curve DB data, keys or dongle ids.
+
+Contract (the device daemon `system/curvedb/curvedb_updated.py` uses exactly this):
+- GET approved: 200 `{sha256, rows_bytes, manifest_sha256, manifest_bytes, build, approved_utc, rows_url, manifest_url}`; URLs are presigned GET, 300 s, for
+  `curvedb/tables/<sha256>/curvedb_v2_rows.json.zst` and `.../manifest.json` (keys are built from `sha256`, never from pointer key strings).
+  404 `{"error":"none published"}` only when `curvedb/approved.json` is missing (NoSuchKey). Any other S3 error, unparseable or malformed pointer: 503.
+- Pointer `s3://<CURVEDB_BUCKET>/curvedb/approved.json` MUST contain: `sha256` (64 hex), `manifest_sha256` (64 hex), `rows_bytes`, `manifest_bytes`
+  (non-negative ints), `build`, `approved_utc` (strings). NOTE: the current cloud-job `shadow/approved.json` has only sha256/rows_key/manifest_key/built_utc/rows,
+  so the approve script (phase 3) must write the extra fields (`rows_bytes` = manifest.json `bytes`; hash/size of manifest.json). Until then the route returns 503 (logged `CURVEDB_POINTER_MALFORMED`).
+- POST report: body <= 2048 bytes JSON object, only keys `live_sha, pointer_sha, last_auto_sha` (64 hex or null), `auto_utc`, `git_sha` (<= 64 chars of `[A-Za-z0-9:._+-]`),
+  `loaded` (bool), `state` (disabled|waiting_clock|waiting_unmetered|none_published|current|installed|held_hand_change|refused|error), `reason` (<= 200 chars, non-printable -> `?`),
+  `free_mb` (int >= 0). Else 400. Writes `curvedb/device/<dongle>/report.json` (+ `received_utc`), logs `CURVEDB_REPORT dongle=.. state=.. live=<sha8>`. Returns 200 `{"ok":true}`; S3 write error 503.
+- Logs never contain tokens or presigned URLs.
+
+Deploy (main session; NOT executed by the coder):
+1. Attach this inline policy to role `comma-uploader-lambda` (backup bucket, not comma-connect):
+```json
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::comma-curvedb-backup-454885954148/curvedb/approved.json","arn:aws:s3:::comma-curvedb-backup-454885954148/curvedb/tables/*"]},
+ {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::comma-curvedb-backup-454885954148/curvedb/device/*/report.json"}]}
+```
+   `aws --profile dipeit iam put-role-policy --role-name comma-uploader-lambda --policy-name curvedb-pull --policy-document file://policy.json`
+2. Env: read the current set (`get-function-configuration --query Environment`), then send the FULL merged set (`--environment` REPLACES) adding
+   `CURVEDB_DONGLES=<dongle>` and `CURVEDB_BUCKET=comma-curvedb-backup-454885954148` (the default already equals this; set it anyway so it is explicit).
+   `DEVICE_PUBKEYS` must contain the dongle's key (the routes fail with `nokey` otherwise).
+3. Code: `zip function.zip handler.py`, `update-function-code --zip-file fileb://function.zip --publish` (note the new version number; record the previous one first with `list-versions-by-function`).
+   API Gateway must route `GET`/`POST /v1/curvedb/{proxy+}` (check the existing route is `$default`/proxy; if per-route, add both).
+4. Verify: forged token -> 401; real device token -> 404 `none published` (or 200 once a pointer exists); CloudWatch shows `CURVEDB_AUTH_FAIL` only for forgeries.
+5. Rollback: repoint to the previous published version (alias, or `update-function-code` with the previous zip). The routes are inert without `CURVEDB_DONGLES`: removing that env var (merged set) disables them with no code change.
